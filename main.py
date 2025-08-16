@@ -31,6 +31,7 @@ CONFIRM_YES = "[ Yes ]"
 CONFIRM_NO = "[ No ]"
 COLOR_PAIR_SELECTED = 1
 COLOR_PAIR_CANCEL = 2
+PRESS_ANY_KEY = "Press any key to continue."
 
 
 # --- HELPERS ---
@@ -70,12 +71,12 @@ def _read_file_lines(filepath: str) -> Optional[List[str]]:
         filepath (str): The path to the file.
 
     Returns:
-        list or None: A list of stripped lines, or None if the file doesn't exist.
+        list or None: A list of lines with only trailing whitespace removed.
     """
     if not os.path.exists(filepath):
         return None
     with open(filepath, 'r', encoding='utf-8') as f:
-        return [line.strip() for line in f.readlines()]
+        return [line.rstrip('\r\n') for line in f.readlines()]
 
 
 def _check_files_exist(*filepaths: str) -> Optional[str]:
@@ -91,6 +92,31 @@ def _check_files_exist(*filepaths: str) -> Optional[str]:
         if not os.path.exists(fp):
             return f"Error: Required file or directory '{fp}' not found."
     return None
+
+
+def _partition_punctuation(line: str, puncts: List[str]) -> Tuple[str, str]:
+    """Splits a line into its base and its full trailing punctuation sequence.
+
+    Args:
+        line (str): The string to partition.
+        puncts (list): A list of punctuation marks, sorted by descending length.
+
+    Returns:
+        tuple: A tuple containing (base_string, punctuation_string).
+    """
+    base = line
+    stripped_once = True
+    while stripped_once:
+        stripped_once = False
+        for p in puncts:
+            if base.endswith(p):
+                base = base[:-len(p)]
+                stripped_once = True
+                break
+    
+    punct_len = len(line) - len(base)
+    punctuation = line[-punct_len:] if punct_len > 0 else ""
+    return base, punctuation
 
 
 # --- CORE ACTIONS ---
@@ -126,7 +152,7 @@ def extract(on_progress: Callable = None) -> Iterator:
                 phrases.append(phrase)
 
     yield "write_files", addresses, names, phrases
-    yield "Extraction complete. Press any key."
+    yield f"Extraction complete. {PRESS_ANY_KEY}"
 
 
 def normalize() -> Iterator:
@@ -142,27 +168,33 @@ def normalize() -> Iterator:
     translated_lines = _read_file_lines(TRANSLATED_PHRASES_FILE)
 
     if len(original_lines) != len(translated_lines):
-        yield "Error: File line counts mismatch."; return
+        yield f"Error: File line counts mismatch. {PRESS_ANY_KEY}"; return
 
     normalized_lines, changes_count = [], 0
+    sorted_puncts = sorted(list(PUNCTUATION_MARKS), key=len, reverse=True)
+
     for orig, trans in zip(original_lines, translated_lines):
         new_trans = trans
+
+        orig_base, orig_punct_seq = _partition_punctuation(orig, sorted_puncts)
+        trans_base, trans_punct_seq = _partition_punctuation(trans, sorted_puncts)
+
+        if orig_punct_seq != trans_punct_seq:
+            new_trans = trans_base + orig_punct_seq
+
         orig_char, _ = _find_first_letter(orig)
         trans_char, trans_idx = _find_first_letter(new_trans)
         if orig_char and trans_char and orig_char.isupper() != trans_char.isupper():
             line_list = list(new_trans)
             line_list[trans_idx] = line_list[trans_idx].upper() if orig_char.isupper() else line_list[trans_idx].lower()
             new_trans = "".join(line_list)
-        orig_punct = next((p for p in PUNCTUATION_MARKS if orig.endswith(p)), None)
-        trans_punct = next((p for p in PUNCTUATION_MARKS if new_trans.endswith(p)), None)
-        if orig_punct != trans_punct:
-            if trans_punct: new_trans = new_trans[:-len(trans_punct)]
-            if orig_punct: new_trans += orig_punct
-        if new_trans != trans: changes_count += 1
+
+        if new_trans != trans:
+            changes_count += 1
         normalized_lines.append(new_trans)
 
     if changes_count == 0:
-        yield "Normalization not needed. All lines conform."; return
+        yield f"Normalization not needed. All lines conform. {PRESS_ANY_KEY}"; return
 
     yield "confirm_normalize", changes_count, normalized_lines
 
@@ -176,17 +208,25 @@ def validate(on_progress: Callable = None) -> Iterator:
     Yields:
         str or tuple: A status message or a tuple with findings for the UI controller.
     """
-    error = _check_files_exist(VALIDATION_RULES_FILE, ORIGINAL_PHRASES_FILE, TRANSLATED_PHRASES_FILE)
+    files_to_check = [
+        VALIDATION_RULES_FILE,
+        ORIGINAL_PHRASES_FILE,
+        TRANSLATED_PHRASES_FILE,
+    ]
+    error = _check_files_exist(*files_to_check)
     if error: yield error; return
 
     try:
         with open(VALIDATION_RULES_FILE, 'r', encoding='utf-8') as f:
             rules = json.load(f).get("rules", [])
     except json.JSONDecodeError:
-        yield f"Error: Could not parse '{VALIDATION_RULES_FILE}'."; return
+        yield f"Error: Could not parse '{VALIDATION_RULES_FILE}'. {PRESS_ANY_KEY}"; return
 
     original_lines = _read_file_lines(ORIGINAL_PHRASES_FILE)
     translated_lines = _read_file_lines(TRANSLATED_PHRASES_FILE)
+
+    if len(original_lines) != len(translated_lines):
+        yield f"Error: Mismatch between original and translated files. {PRESS_ANY_KEY}"; return
 
     errors = []
     total_lines = len(original_lines)
@@ -196,11 +236,13 @@ def validate(on_progress: Callable = None) -> Iterator:
             en, eo_values = rule.get("en"), rule.get("eo")
             if not en or not eo_values: continue
             if not isinstance(eo_values, list): eo_values = [eo_values]
-            if _has_word(orig_line, en) and not any(_has_word(trans_line, eo) for eo in eo_values):
+            
+            # Asymmetrical logic: Whole word for original, substring for translation.
+            if _has_word(orig_line, en) and not any(eo.lower() in trans_line.lower() for eo in eo_values):
                 errors.append(f"L{i+1:04d}: Found '{en}' but missing one of: {eo_values}")
     
     if not errors:
-        yield "Validation passed! All keyword rules are met."
+        yield f"Validation passed! All keyword rules are met. {PRESS_ANY_KEY}"
     else:
         yield "confirm_view_errors", errors
 
@@ -220,7 +262,7 @@ def patch(on_progress: Callable = None) -> Iterator[str]:
     translations = _read_file_lines(TRANSLATED_PHRASES_FILE)
     addresses = _read_file_lines(ADDRESSES_FILE)
     if len(translations) != len(addresses):
-        yield "Error: Mismatch between translation and address files."; return
+        yield f"Error: Mismatch between translation and address files. {PRESS_ANY_KEY}"; return
 
     file_map = defaultdict(list)
     for i, addr in enumerate(addresses):
@@ -244,31 +286,36 @@ def patch(on_progress: Callable = None) -> Iterator[str]:
                 lines[line_num-1] = lines[line_num-1][:start] + translations[idx] + lines[line_num-1][end:]
         with open(os.path.join(PATCHED_DIR, filename), "w", encoding="utf-8") as dst:
             dst.write("\n".join(lines))
-    yield "Patching complete! Press any key."
+    yield f"Patching complete! {PRESS_ANY_KEY}"
 
 
 # --- TUI ---
 
-def view_errors(win: curses.window, title: str, lines: List[str]):
+def view_errors(win: curses.window, title: str, lines: List[str]) -> bool:
     """A scrollable text viewer for lists of strings.
 
     Args:
         win (curses.window): The curses window to draw in.
         title (str): The title to display at the top.
         lines (list): A list of strings to display.
+    
+    Returns:
+        bool: True if a refresh was requested, False otherwise.
     """
     h, w = win.getmaxyx()
     scroll_pos = 0
     while True:
         win.clear(); win.refresh()
         win.addstr(0, 2, f"{title} ({len(lines)} entries)", curses.A_BOLD)
-        win.addstr(h - 1, 2, "UP/DOWN to scroll. 'q' to exit.")
+        win.addstr(h - 1, 2, "UP/DOWN to scroll, 'r' to re-run validation, 'q' to exit.")
         for i, line in enumerate(lines[scroll_pos : scroll_pos + h - 2]):
             win.addstr(i + 1, 2, line[:w-3])
         key = win.getch()
         if key == curses.KEY_UP and scroll_pos > 0: scroll_pos -= 1
         elif key == curses.KEY_DOWN and scroll_pos < len(lines) - (h - 2): scroll_pos += 1
+        elif key == ord('r'): return True  # Signal a refresh
         elif key == ord('q'): break
+    return False
 
 
 def show_progress(win: curses.window, current: int, total: int, message: str):
@@ -394,42 +441,54 @@ def main_loop(stdscr: curses.window):
         elif key in [curses.KEY_ENTER, 10, 13]:
             if selection == len(menu) - 1: break
             
-            status = ""
-            try:
-                action_func = actions[selection]
-                progress_callback = lambda current, total, msg: show_progress(content_win, current, total, msg)
-                action_generator = action_func(on_progress=progress_callback) if action_func in [extract, validate, patch] else action_func()
+            # This loop allows the 'r' key in view_errors to restart the validation
+            while True:
+                status = ""
+                should_rerun = False
+                try:
+                    action_func = actions[selection]
+                    progress_callback = lambda current, total, msg: show_progress(content_win, current, total, msg)
+                    action_generator = action_func(on_progress=progress_callback) if action_func in [extract, validate, patch] else action_func()
 
-                for result in action_generator:
-                    match result:
-                        case ("write_files", addresses, names, phrases):
-                            files_to_write = [(ADDRESSES_FILE, addresses), (NAMES_FILE, names), (ORIGINAL_PHRASES_FILE, phrases)]
-                            for filepath, data in files_to_write:
-                                with open(filepath, "w", encoding="utf-8") as f: f.write("\n".join(data))
-                            if os.path.exists(TRANSLATED_PHRASES_FILE):
-                                if confirm(content_win, f"'{TRANSLATED_PHRASES_FILE}' exists. Overwrite?"):
-                                    shutil.copy(ORIGINAL_PHRASES_FILE, TRANSLATED_PHRASES_FILE)
-                            else: shutil.copy(ORIGINAL_PHRASES_FILE, TRANSLATED_PHRASES_FILE)
-                        
-                        case ("confirm_normalize", changes, lines):
-                            if confirm(content_win, f"Found {changes} lines to normalize. Apply changes?"):
-                                with open(TRANSLATED_PHRASES_FILE, 'w', encoding='utf-8') as f: f.write("\n".join(lines))
-                                status = f"Normalized {changes} lines."
-                            else: status = "Normalization cancelled."
-                        
-                        case ("confirm_view_errors", errors):
-                            if confirm(content_win, f"Found {len(errors)} validation errors. View them?"):
-                                view_errors(content_win, "Keyword Validation Errors", errors)
-                                status = "Finished reviewing errors."
-                            else: status = "Validation finished. Errors not viewed."
-                        
-                        case str(message):
-                            status = message
-            
-            except Exception as e:
-                status = f"An unexpected error occurred: {e}"
-            
-            show_message(content_win, status)
+                    for result in action_generator:
+                        match result:
+                            case ("write_files", addresses, names, phrases):
+                                files_to_write = [(ADDRESSES_FILE, addresses), (NAMES_FILE, names), (ORIGINAL_PHRASES_FILE, phrases)]
+                                for filepath, data in files_to_write:
+                                    with open(filepath, "w", encoding="utf-8") as f: f.write("\n".join(data))
+                                if os.path.exists(TRANSLATED_PHRASES_FILE):
+                                    if confirm(content_win, f"'{TRANSLATED_PHRASES_FILE}' exists. Overwrite?"):
+                                        shutil.copy(ORIGINAL_PHRASES_FILE, TRANSLATED_PHRASES_FILE)
+                                else: shutil.copy(ORIGINAL_PHRASES_FILE, TRANSLATED_PHRASES_FILE)
+                            
+                            case ("confirm_normalize", changes, lines):
+                                if confirm(content_win, f"Found {changes} lines to normalize. Apply changes?"):
+                                    with open(TRANSLATED_PHRASES_FILE, 'w', encoding='utf-8') as f: f.write("\n".join(lines))
+                                    status = f"Normalized {changes} lines. {PRESS_ANY_KEY}"
+                                else: status = f"Normalization cancelled. {PRESS_ANY_KEY}"
+                            
+                            case ("confirm_view_errors", errors):
+                                if confirm(content_win, f"Found {len(errors)} validation errors. View them?"):
+                                    wants_refresh = view_errors(content_win, "Keyword Validation Errors", errors)
+                                    if wants_refresh and selection == 2:  # Re-run only if it was the validate action
+                                        should_rerun = True
+                                        break
+                                    status = f"Finished reviewing errors. {PRESS_ANY_KEY}"
+                                else: status = f"Validation finished. Errors not viewed. {PRESS_ANY_KEY}"
+                            
+                            case str(message):
+                                status = message
+                
+                except Exception as e:
+                    status = f"An unexpected error occurred: {e}. {PRESS_ANY_KEY}"
+                
+                if should_rerun:
+                    continue  # Re-run the validation action
+                
+                if status:
+                    show_message(content_win, status)
+                
+                break # Exit the inner while loop and go back to menu
 
 
 if __name__ == "__main__":
